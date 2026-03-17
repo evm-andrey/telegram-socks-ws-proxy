@@ -1,0 +1,17 @@
+/target/
+
+# Local temporary artifacts
+/.codex-tmp/
+/output/
+
+# Environment files
+.env
+.env.*
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
