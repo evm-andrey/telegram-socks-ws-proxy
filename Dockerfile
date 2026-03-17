@@ -1,10 +1,12 @@
-FROM rust:1 AS builder
+FROM rust:1-bookworm AS builder
 
 WORKDIR /build
-COPY . .
-RUN cargo build --release
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release \
+    && strip /build/target/release/tg-ws-proxy-rs
 
-FROM rust:1-slim
+FROM debian:bookworm-slim
 ARG VERSION=0.1.0
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown

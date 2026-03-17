@@ -1,12 +1,15 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_native_tls::{native_tls, TlsConnector, TlsStream};
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::{self, pki_types::ServerName};
+use tokio_rustls::TlsConnector;
 
 type WsStream = TlsStream<TcpStream>;
 
@@ -189,10 +192,13 @@ pub async fn handshake(_ip: &str, domain: &str) -> Result<WsHandshake, WsError> 
     Ok(hs)
 }
 
-fn tls_connector() -> Result<native_tls::TlsConnector, WsError> {
-    native_tls::TlsConnector::builder()
-        .build()
-        .map_err(|err| WsError::Tls(err.to_string()))
+fn tls_connector() -> TlsConnector {
+    let root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(config))
 }
 
 async fn connect_raw(domain: &str, timeout_dur: Duration) -> Result<WsStream, WsError> {
@@ -202,8 +208,10 @@ async fn connect_raw(domain: &str, timeout_dur: Duration) -> Result<WsStream, Ws
         Err(_) => return Err(WsError::Timeout),
     };
 
-    let connector = TlsConnector::from(tls_connector()?);
-    let tls = timeout(timeout_dur, connector.connect(domain, tcp)).await;
+    let server_name = ServerName::try_from(domain.to_string())
+        .map_err(|err| WsError::Tls(format!("invalid server name: {err}")))?;
+    let connector = tls_connector();
+    let tls = timeout(timeout_dur, connector.connect(server_name, tcp)).await;
     match tls {
         Ok(connected) => connected.map_err(|err| WsError::Tls(err.to_string())),
         Err(_) => Err(WsError::Timeout),

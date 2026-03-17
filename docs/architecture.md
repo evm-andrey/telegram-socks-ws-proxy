@@ -178,6 +178,8 @@ Build model:
 
 - stage 1: compile release binary with Rust toolchain
 - stage 2: run on `rust:1-slim`
+- same Dockerfile is used for both `linux/amd64` and `linux/arm64`
+- multi-arch publishing is expected to happen through `docker buildx`
 - exposes:
   - `1080/tcp` SOCKS5
   - `8080/tcp` health

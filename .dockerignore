@@ -1,7 +1,11 @@
 target
 .git
 .idea
+docs
+output
+artifacts
+docker-save
+*.md
 *.log
 *.swp
 .DS_Store
-
