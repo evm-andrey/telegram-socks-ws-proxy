@@ -5,7 +5,16 @@ COPY . .
 RUN cargo build --release
 
 FROM rust:1-slim
+ARG VERSION=0.1.0
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
 WORKDIR /app
+LABEL org.opencontainers.image.title="telegram-socks-ws-proxy" \
+      org.opencontainers.image.description="SOCKS5 proxy for Telegram that routes MTProto traffic through Telegram WebSocket endpoints" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.source="https://github.com/evm-andrey/telegram-socks-ws-proxy"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
