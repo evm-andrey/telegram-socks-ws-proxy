@@ -107,11 +107,13 @@ Responsibilities:
 - raw TCP connect
 - TLS handshake with Telegram Web endpoints
 - manual HTTP Upgrade request for `/apiws`
+- strict validation of `101` upgrade response and expected WebSocket headers
 - raw WebSocket frame encoding and decoding
 - ping/pong handling
 - close frame parsing with code and reason
 
 The handshake is browser-like on purpose, because Telegram WebSocket endpoints are sensitive to request shape.
+The response validation is strict on purpose as well: partial or malformed upgrades are rejected before relay starts.
 
 ### Bidirectional Relay
 

@@ -1,5 +1,6 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use sha1::{Digest, Sha1};
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +13,8 @@ use tokio_rustls::rustls::{self, pki_types::ServerName};
 use tokio_rustls::TlsConnector;
 
 type WsStream = TlsStream<TcpStream>;
+const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const MAX_HANDSHAKE_HEADER_SIZE: usize = 8192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WsCloseInfo {
@@ -41,6 +44,22 @@ pub struct WsHandshake {
     pub status: u16,
     pub redirected: bool,
     pub location: Option<String>,
+}
+
+#[derive(Debug)]
+struct WsHandshakeRequest {
+    payload: String,
+    expected_accept: String,
+}
+
+#[derive(Debug, Default)]
+struct WsHandshakeResponse {
+    status: u16,
+    location: Option<String>,
+    upgrade: Option<String>,
+    connection: Option<String>,
+    accept: Option<String>,
+    protocol: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -222,14 +241,33 @@ async fn perform_handshake<S>(mut stream: S, domain: &str) -> Result<(S, WsHands
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    stream
-        .write_all(build_handshake_request(domain)?.as_bytes())
-        .await?;
+    let request = build_handshake_request(domain)?;
+    stream.write_all(request.payload.as_bytes()).await?;
     stream.flush().await?;
 
+    let header = read_handshake_headers(&mut stream).await?;
+    let response = parse_handshake_response(&header)?;
+    if response.status == 101 {
+        validate_handshake_response(&response, &request.expected_accept)?;
+    }
+
+    Ok((
+        stream,
+        WsHandshake {
+            status: response.status,
+            redirected: (301..400).contains(&response.status),
+            location: response.location,
+        },
+    ))
+}
+
+async fn read_handshake_headers<S>(stream: &mut S) -> Result<Vec<u8>, WsError>
+where
+    S: AsyncRead + Unpin,
+{
     let mut header: Vec<u8> = Vec::new();
     let mut last_two = [0u8; 2];
-    while header.len() < 8192 {
+    while header.len() < MAX_HANDSHAKE_HEADER_SIZE {
         let mut b = [0u8; 1];
         let read = stream.read(&mut b).await?;
         if read == 0 {
@@ -245,28 +283,83 @@ where
         }
     }
 
+    if !header.ends_with(b"\r\n\r\n") {
+        return Err(WsError::Handshake(
+            "oversized_handshake_headers".to_string(),
+        ));
+    }
+
+    Ok(header)
+}
+
+fn parse_handshake_response(header: &[u8]) -> Result<WsHandshakeResponse, WsError> {
     let mut iter = header.split(|b| *b == b'\n');
     let first_line = iter.next().unwrap_or_default();
-    let status = parse_status(first_line)?;
-    let mut location = None;
+    let mut response = WsHandshakeResponse {
+        status: parse_status(first_line)?,
+        ..Default::default()
+    };
+
     for line in iter {
         if line == b"\r" || line.is_empty() {
             break;
         }
-        let line = std::str::from_utf8(line).unwrap_or_default();
-        if let Some(value) = line.to_lowercase().strip_prefix("location:") {
-            location = Some(value.trim().to_string());
+        let line = std::str::from_utf8(line)
+            .unwrap_or_default()
+            .trim_end_matches('\r');
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| WsError::Handshake("malformed_handshake_header".to_string()))?;
+        let value = value.trim();
+
+        if name.eq_ignore_ascii_case("location") {
+            response.location = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("upgrade") {
+            response.upgrade = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("connection") {
+            response.connection = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("sec-websocket-accept") {
+            response.accept = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("sec-websocket-protocol") {
+            response.protocol = Some(value.to_string());
         }
     }
 
-    Ok((
-        stream,
-        WsHandshake {
-            status,
-            redirected: (301..400).contains(&status),
-            location,
-        },
-    ))
+    Ok(response)
+}
+
+fn validate_handshake_response(
+    response: &WsHandshakeResponse,
+    expected_accept: &str,
+) -> Result<(), WsError> {
+    match response.upgrade.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("websocket") => {}
+        _ => return Err(WsError::Handshake("missing_upgrade".to_string())),
+    }
+
+    match response.connection.as_deref() {
+        Some(value) if has_header_token(value, "upgrade") => {}
+        _ => return Err(WsError::Handshake("missing_connection_upgrade".to_string())),
+    }
+
+    match response.accept.as_deref() {
+        Some(value) if value == expected_accept => {}
+        Some(_) => return Err(WsError::Handshake("invalid_ws_accept".to_string())),
+        None => return Err(WsError::Handshake("missing_ws_accept".to_string())),
+    }
+
+    match response.protocol.as_deref() {
+        Some("binary") => Ok(()),
+        Some(_) => Err(WsError::Handshake("unexpected_ws_protocol".to_string())),
+        None => Err(WsError::Handshake("missing_ws_protocol".to_string())),
+    }
+}
+
+fn has_header_token(value: &str, token: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|part| part.eq_ignore_ascii_case(token))
 }
 
 fn parse_status(line: &[u8]) -> Result<u16, WsError> {
@@ -281,9 +374,16 @@ fn parse_status(line: &[u8]) -> Result<u16, WsError> {
         .map_err(|_| WsError::Handshake("bad status".to_string()))
 }
 
-fn build_handshake_request(domain: &str) -> Result<String, WsError> {
-    let key = websocket_key()?;
-    Ok(format!(
+fn build_handshake_request(domain: &str) -> Result<WsHandshakeRequest, WsError> {
+    build_handshake_request_with_key(domain, &websocket_key()?)
+}
+
+fn build_handshake_request_with_key(
+    domain: &str,
+    key: &str,
+) -> Result<WsHandshakeRequest, WsError> {
+    Ok(WsHandshakeRequest {
+        payload: format!(
         "GET /apiws HTTP/1.1\r\n\
 Host: {domain}\r\n\
 Upgrade: websocket\r\n\
@@ -298,7 +398,9 @@ Accept-Encoding: gzip, deflate, br, zstd\r\n\
 User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36\r\n\
 Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\
 \r\n"
-    ))
+        ),
+        expected_accept: websocket_accept(key),
+    })
 }
 
 fn websocket_key() -> Result<String, WsError> {
@@ -306,6 +408,13 @@ fn websocket_key() -> Result<String, WsError> {
     getrandom::getrandom(&mut key)
         .map_err(|err| WsError::Handshake(format!("ws key generation failed: {err}")))?;
     Ok(BASE64_STANDARD.encode(key))
+}
+
+fn websocket_accept(key: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(WS_GUID);
+    BASE64_STANDARD.encode(hasher.finalize())
 }
 
 fn build_frame(payload: &[u8]) -> Vec<u8> {
@@ -418,9 +527,11 @@ fn parse_close_payload(payload: &[u8]) -> WsCloseInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_frame, build_handshake_request, parse_status, read_frame, WsCloseInfo, WsFrame,
+        build_frame, build_handshake_request_with_key, parse_handshake_response, parse_status,
+        perform_handshake, read_frame, validate_handshake_response, websocket_accept, WsCloseInfo,
+        WsError, WsFrame,
     };
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     #[test]
@@ -439,23 +550,129 @@ mod tests {
     #[test]
     fn handshake_request_contains_domain_header() {
         let domain = "test.dc.example";
-        let req = build_handshake_request(domain).unwrap();
-        assert!(req.starts_with("GET /apiws HTTP/1.1\r\n"));
-        assert!(req.contains(&format!("Host: {domain}\r\n")));
-        assert!(req.contains("Upgrade: websocket\r\n"));
-        assert!(req.contains("Connection: Upgrade\r\n"));
-        assert!(req.contains("Cache-Control: no-cache\r\n"));
-        assert!(req.contains("Pragma: no-cache\r\n"));
-        assert!(req.contains("Sec-WebSocket-Protocol: binary\r\n"));
-        assert!(req.contains("Accept-Encoding: gzip, deflate, br, zstd\r\n"));
+        let req = build_handshake_request_with_key(domain, "dGhlIHNhbXBsZSBub25jZQ==").unwrap();
+        assert!(req.payload.starts_with("GET /apiws HTTP/1.1\r\n"));
+        assert!(req.payload.contains(&format!("Host: {domain}\r\n")));
+        assert!(req.payload.contains("Upgrade: websocket\r\n"));
+        assert!(req.payload.contains("Connection: Upgrade\r\n"));
+        assert!(req.payload.contains("Cache-Control: no-cache\r\n"));
+        assert!(req.payload.contains("Pragma: no-cache\r\n"));
+        assert!(req.payload.contains("Sec-WebSocket-Protocol: binary\r\n"));
         assert!(req
+            .payload
+            .contains("Accept-Encoding: gzip, deflate, br, zstd\r\n"));
+        assert!(req
+            .payload
             .contains("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n"));
-        assert!(req.contains("User-Agent: Mozilla/5.0 (X11; Linux x86_64)"));
+        assert!(req
+            .payload
+            .contains("User-Agent: Mozilla/5.0 (X11; Linux x86_64)"));
         let key_line = req
+            .payload
             .lines()
             .find(|line| line.starts_with("Sec-WebSocket-Key: "))
             .unwrap();
         assert!(key_line.len() > "Sec-WebSocket-Key: ".len());
+        assert_eq!(req.expected_accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    #[test]
+    fn websocket_accept_matches_rfc_sample() {
+        assert_eq!(
+            websocket_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    #[test]
+    fn strict_handshake_validation_accepts_expected_headers() {
+        let req = build_handshake_request_with_key("test.dc.example", "dGhlIHNhbXBsZSBub25jZQ==")
+            .unwrap();
+        let response = parse_handshake_response(
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+Upgrade: WebSocket\r\n\
+Connection: keep-alive, Upgrade\r\n\
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+Sec-WebSocket-Protocol: binary\r\n\
+\r\n",
+        )
+        .unwrap();
+
+        validate_handshake_response(&response, &req.expected_accept).unwrap();
+    }
+
+    #[test]
+    fn strict_handshake_validation_rejects_missing_accept() {
+        let req = build_handshake_request_with_key("test.dc.example", "dGhlIHNhbXBsZSBub25jZQ==")
+            .unwrap();
+        let response = parse_handshake_response(
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Protocol: binary\r\n\
+\r\n",
+        )
+        .unwrap();
+
+        let err = validate_handshake_response(&response, &req.expected_accept).unwrap_err();
+        assert!(matches!(err, WsError::Handshake(reason) if reason == "missing_ws_accept"));
+    }
+
+    #[test]
+    fn strict_handshake_validation_rejects_connection_without_upgrade_token() {
+        let req = build_handshake_request_with_key("test.dc.example", "dGhlIHNhbXBsZSBub25jZQ==")
+            .unwrap();
+        let response = parse_handshake_response(
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+Upgrade: websocket\r\n\
+Connection: keep-alive\r\n\
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+Sec-WebSocket-Protocol: binary\r\n\
+\r\n",
+        )
+        .unwrap();
+
+        let err = validate_handshake_response(&response, &req.expected_accept).unwrap_err();
+        assert!(
+            matches!(err, WsError::Handshake(reason) if reason == "missing_connection_upgrade")
+        );
+    }
+
+    #[test]
+    fn strict_handshake_validation_rejects_wrong_protocol() {
+        let req = build_handshake_request_with_key("test.dc.example", "dGhlIHNhbXBsZSBub25jZQ==")
+            .unwrap();
+        let response = parse_handshake_response(
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+Upgrade: websocket\r\n\
+Connection: Upgrade\r\n\
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+Sec-WebSocket-Protocol: text\r\n\
+\r\n",
+        )
+        .unwrap();
+
+        let err = validate_handshake_response(&response, &req.expected_accept).unwrap_err();
+        assert!(matches!(err, WsError::Handshake(reason) if reason == "unexpected_ws_protocol"));
+    }
+
+    #[tokio::test]
+    async fn perform_handshake_rejects_oversized_headers() {
+        let (mut client, mut server) = duplex(32 * 1024);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let _ = server.read(&mut buf).await.unwrap();
+            let mut response = b"HTTP/1.1 101 Switching Protocols\r\n".to_vec();
+            response.extend(std::iter::repeat_n(b'a', 9000));
+            server.write_all(&response).await.unwrap();
+        });
+
+        let err = perform_handshake(&mut client, "test.dc.example")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WsError::Handshake(reason) if reason == "oversized_handshake_headers")
+        );
     }
 
     #[tokio::test]
