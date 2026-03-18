@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 - 2026-03-18
+
+- Added SOCKS5 username/password authentication via `SOCKS_USERS` with support for multiple accounts.
+- Simplified published proxy link generation to follow bind addresses only; removed `announce` overrides from CLI and docs.
+- Updated Docker and release examples for the current `amd64`-focused build path and `0.1.2` image tag.
+
 ## 0.1.1 - 2026-03-17
 
 - Switched TLS client stack from OpenSSL/native-tls to `rustls` with the `ring` backend.

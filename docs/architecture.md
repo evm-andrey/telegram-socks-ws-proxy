@@ -8,7 +8,7 @@ The current design has one target behavior:
 
 - Telegram IPv4 MTProto traffic is bridged through Telegram WebSocket endpoints `kws*.web.telegram.org`.
 - Non-Telegram traffic is passed through as plain TCP.
-- Some Telegram IPv6 traffic is passed through directly because IPv6-to-DC WS mapping is not implemented yet.
+- Telegram IPv6 traffic uses the same WS path when `dc/media` is present in init or learned in runtime cache; unknown first-hit IPv6 targets may still fall back to direct passthrough.
 
 ## Runtime Model
 
@@ -36,6 +36,7 @@ Responsibilities:
 - CLI parsing
 - health endpoint address
 - timeouts
+- explicit announce addrs for printed proxy links
 - `tg://socks?...` link generation
 
 ### TCP Server
@@ -44,7 +45,7 @@ Responsibilities:
 
 Responsibilities:
 
-- bind SOCKS listener on `host:port`
+- bind SOCKS listeners on both families for wildcard host
 - accept inbound TCP connections
 - spawn one async task per client
 - spawn health endpoint server
@@ -88,8 +89,9 @@ Important behavior:
 
 Responsibilities:
 
-- known Telegram IPv4 range detection
-- IP-to-DC mapping for common Telegram DC targets
+- known Telegram IPv4 and IPv6 range detection
+- IP-to-DC mapping for common Telegram IPv4 DC targets
+- runtime learning of IPv6 `target -> dc/media`
 - MTProto init packet DC extraction
 - MTProto init packet DC patching when needed
 - stateful MTProto abridged message splitting for TCP-to-WS framing
@@ -133,19 +135,20 @@ Responsibilities:
 - bind simple HTTP endpoint
 - return `200 OK`
 
-Default health address is `0.0.0.0:8080`.
+Default health address is `[::]:8080`, which binds both `0.0.0.0:8080` and `[::]:8080`.
 
 ## Data Flow
 
 1. Client connects to SOCKS5 listener.
 2. Proxy parses SOCKS5 CONNECT request.
-3. If target is not Telegram IPv4, proxy uses direct TCP passthrough.
+3. If target is not a known Telegram IPv4/IPv6 address, proxy uses direct TCP passthrough.
 4. If target looks like Telegram, proxy reads the 64-byte MTProto init packet.
-5. Proxy extracts DC and media flag from obfuscated init, or patches it from known IP mapping.
-6. Proxy selects a WebSocket endpoint such as `kws2.web.telegram.org`.
-7. Proxy performs TLS + HTTP Upgrade.
-8. Proxy sends MTProto init packet through WebSocket.
-9. Proxy relays traffic both directions until one side closes.
+5. Proxy extracts DC and media flag from obfuscated init, or patches it from known/static mapping.
+6. For IPv6 targets with extracted DC, proxy stores a runtime mapping for later sessions to the same target.
+7. Proxy selects a WebSocket endpoint such as `kws2.web.telegram.org`.
+8. Proxy performs TLS + HTTP Upgrade.
+9. Proxy sends MTProto init packet through WebSocket.
+10. Proxy relays traffic both directions until one side closes.
 
 ## Observability
 
@@ -167,7 +170,7 @@ This is the main operational debugging surface today. There is no `/metrics` end
 - No SOCKS5 authentication
 - No metric backend
 - No WebSocket pooling in active use
-- Telegram IPv6 is not mapped to DC for WS routing
+- Telegram IPv6 still depends on init extraction or runtime-learned mapping; fully static IPv6-to-DC coverage is not complete
 - Some Telegram clients create many short-lived probe connections; this is expected noise in logs
 
 ## Container Layout
@@ -178,8 +181,7 @@ Build model:
 
 - stage 1: compile release binary with Rust toolchain
 - stage 2: run on `rust:1-slim`
-- same Dockerfile is used for both `linux/amd64` and `linux/arm64`
-- multi-arch publishing is expected to happen through `docker buildx`
+- current release flow is temporarily focused on `linux/amd64`
 - exposes:
   - `1080/tcp` SOCKS5
   - `8080/tcp` health

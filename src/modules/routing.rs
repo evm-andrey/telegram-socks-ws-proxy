@@ -3,10 +3,12 @@ use crate::modules::relay::{bridge_tcp_tcp, bridge_tcp_tcp_with_prelude, bridge_
 use crate::modules::socks::{handle_socks5_handshake, is_ipv6, SocksCommand};
 use crate::modules::telegram::{
     extract_dc, ip_to_dc, is_telegram_ip, patch_init_dc, ws_domains, MtProtoMessageSplitter,
+    TelegramIpEntry,
 };
 use crate::modules::ws::RawWsClient;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -19,6 +21,8 @@ const WS_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
 const WS_ATTEMPT_WINDOW: Duration = Duration::from_secs(15);
 
 static WS_BACKOFF: Lazy<Mutex<WsBackoff>> = Lazy::new(|| Mutex::new(WsBackoff::default()));
+static LEARNED_IPV6_DC: Lazy<Mutex<HashMap<Ipv6Addr, TelegramIpEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Default)]
 struct WsBackoff {
@@ -78,7 +82,7 @@ pub async fn route_client(
     cfg: Arc<RoutedConfig>,
 ) {
     let peer = peer.to_string();
-    let command = match handle_socks5_handshake(&mut stream).await {
+    let command = match handle_socks5_handshake(&mut stream, cfg.socks_auth.as_ref()).await {
         Ok(cmd) => cmd,
         Err(err) => {
             warn!("invalid socks request from {}: {:?}", peer, err);
@@ -92,8 +96,9 @@ pub async fn route_client(
     } = command;
 
     let target_is_ipv6 = is_ipv6(&target_host);
+    let target_is_telegram = is_telegram_ip(&target_host);
 
-    if !target_is_ipv6 && !is_telegram_ip(&target_host) {
+    if !target_is_telegram {
         debug!("passthrough {} -> {}:{}", peer, target_host, target_port);
         if let Err(err) = bridge_tcp_tcp(stream, &target_host, target_port).await {
             warn!("passthrough failed: {}", err);
@@ -124,7 +129,7 @@ pub async fn route_client(
     let mut patched = false;
 
     if info.dc.is_none() {
-        if let Some(entry) = ip_to_dc(&target_host) {
+        if let Some(entry) = learned_ipv6_entry(&target_host).or_else(|| ip_to_dc(&target_host)) {
             let dc_signed = if entry.is_media {
                 -(entry.dc as i16)
             } else {
@@ -136,6 +141,18 @@ pub async fn route_client(
             patched = true;
             info.dc = Some(entry.dc);
             info.is_media = entry.is_media;
+        }
+    }
+
+    if target_is_ipv6 {
+        if let Some(dc) = info.dc {
+            remember_ipv6_entry(
+                &target_host,
+                TelegramIpEntry {
+                    dc,
+                    is_media: info.is_media,
+                },
+            );
         }
     }
 
@@ -262,8 +279,7 @@ fn is_http_transport(buf: &[u8]) -> bool {
 }
 
 pub fn route_decision(host: &str, port: u16, has_dc: bool) -> &'static str {
-    let target_is_ipv6 = is_ipv6(host);
-    if !target_is_ipv6 && !is_telegram_ip(host) {
+    if !is_telegram_ip(host) {
         return "tcp_passthrough";
     }
     if has_dc && port != 0 {
@@ -271,6 +287,25 @@ pub fn route_decision(host: &str, port: u16, has_dc: bool) -> &'static str {
     } else {
         "unknown_dc"
     }
+}
+
+fn learned_ipv6_entry(host: &str) -> Option<TelegramIpEntry> {
+    let ip = host.parse::<Ipv6Addr>().ok()?;
+    LEARNED_IPV6_DC
+        .lock()
+        .expect("ipv6 dc cache lock")
+        .get(&ip)
+        .cloned()
+}
+
+fn remember_ipv6_entry(host: &str, entry: TelegramIpEntry) {
+    let Ok(ip) = host.parse::<Ipv6Addr>() else {
+        return;
+    };
+    LEARNED_IPV6_DC
+        .lock()
+        .expect("ipv6 dc cache lock")
+        .insert(ip, entry);
 }
 
 #[cfg(test)]
@@ -282,8 +317,10 @@ mod tests {
     fn route_rules() {
         assert_eq!(route_decision("8.8.8.8", 443, false), "tcp_passthrough");
         assert_eq!(route_decision("149.154.175.50", 443, true), "ws_only");
-        assert_eq!(route_decision("2001:db8::1", 443, true), "ws_only");
+        assert_eq!(route_decision("2001:67c:4e8::1", 443, true), "ws_only");
+        assert_eq!(route_decision("2001:db8::1", 443, true), "tcp_passthrough");
         assert_eq!(route_decision("149.154.175.50", 443, false), "unknown_dc");
+        assert_eq!(route_decision("2001:67c:4e8::1", 443, false), "unknown_dc");
     }
 
     #[test]

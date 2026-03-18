@@ -1,7 +1,7 @@
 use aes::cipher::{KeyIvInit, StreamCipher};
 use aes::Aes256;
 use once_cell::sync::Lazy;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 pub type Aes256Ctr = ctr::Ctr128BE<Aes256>;
@@ -322,14 +322,44 @@ pub static TG_RANGES: Lazy<Vec<(u32, u32, AddressKind)>> = Lazy::new(|| {
     ]
 });
 
+pub static TG_IPV6_RANGES: Lazy<Vec<(u128, u128, AddressKind)>> = Lazy::new(|| {
+    vec![
+        (
+            ipv6_to_u128("2001:67c:4e8::"),
+            ipv6_to_u128("2001:67c:4e8:ffff:ffff:ffff:ffff:ffff"),
+            AddressKind::Telegram,
+        ),
+        (
+            ipv6_to_u128("2001:b28:f23d::"),
+            ipv6_to_u128("2001:b28:f23d:ffff:ffff:ffff:ffff:ffff"),
+            AddressKind::Telegram,
+        ),
+        (
+            ipv6_to_u128("2001:b28:f23f::"),
+            ipv6_to_u128("2001:b28:f23f:ffff:ffff:ffff:ffff:ffff"),
+            AddressKind::Telegram,
+        ),
+    ]
+});
+
 pub fn is_telegram_ip(ip: &str) -> bool {
-    let Ok(ip) = Ipv4Addr::from_str(ip) else {
+    let Ok(ip) = IpAddr::from_str(ip) else {
         return false;
     };
-    let value = u32::from(ip);
-    TG_RANGES.iter().any(|(start, end, kind)| {
-        *kind == AddressKind::Telegram && value >= *start && value <= *end
-    })
+    match ip {
+        IpAddr::V4(ip) => {
+            let value = u32::from(ip);
+            TG_RANGES.iter().any(|(start, end, kind)| {
+                *kind == AddressKind::Telegram && value >= *start && value <= *end
+            })
+        }
+        IpAddr::V6(ip) => {
+            let value = u128::from(ip);
+            TG_IPV6_RANGES.iter().any(|(start, end, kind)| {
+                *kind == AddressKind::Telegram && value >= *start && value <= *end
+            })
+        }
+    }
 }
 
 pub fn ip_to_dc(ip: &str) -> Option<TelegramIpEntry> {
@@ -534,6 +564,11 @@ fn ip_to_u32(ip: &str) -> u32 {
     u32::from(parsed)
 }
 
+fn ipv6_to_u128(ip: &str) -> u128 {
+    let parsed = Ipv6Addr::from_str(ip).unwrap();
+    u128::from(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,7 +576,9 @@ mod tests {
     #[test]
     fn telegram_ranges_work() {
         assert!(is_telegram_ip("91.108.0.1"));
+        assert!(is_telegram_ip("2001:67c:4e8::1"));
         assert!(!is_telegram_ip("1.1.1.1"));
+        assert!(!is_telegram_ip("2001:db8::1"));
     }
 
     #[test]

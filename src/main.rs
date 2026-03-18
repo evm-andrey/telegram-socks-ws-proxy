@@ -3,6 +3,7 @@ mod modules;
 mod runtime;
 
 use crate::config::{telegram_socks_proxy_links, CliConfig};
+use crate::runtime::listen::host_is_unspecified;
 use crate::runtime::server::run_server;
 use crate::runtime::shutdown::wait_for_shutdown_signal;
 use clap::Parser;
@@ -19,8 +20,8 @@ async fn main() {
     for link in telegram_socks_proxy_links(&cli.host, cli.port) {
         info!("telegram socks proxy link: {}", link);
     }
-    if cli.host == "0.0.0.0" {
-        info!("for external clients replace 0.0.0.0 with reachable host/IP in the proxy link");
+    if host_is_unspecified(&cli.host) {
+        info!("links are announced from detected local addresses");
     }
 
     let server = run_server(cli.clone());

@@ -1,6 +1,6 @@
 [package]
 name = "tg-ws-proxy-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "SOCKS5 proxy for Telegram that routes MTProto traffic through Telegram WebSocket endpoints"
 license = "MIT"
@@ -23,6 +23,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 webpki-roots = "1"
 base64 = "0.22"
 getrandom = "0.2"
+socket2 = "0.5"
+if-addrs = "0.13"
 
 [profile.release]
 lto = false

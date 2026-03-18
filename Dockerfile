@@ -7,7 +7,7 @@ RUN cargo build --release \
     && strip /build/target/release/tg-ws-proxy-rs
 
 FROM debian:bookworm-slim
-ARG VERSION=0.1.0
+ARG VERSION=0.1.2
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 WORKDIR /app

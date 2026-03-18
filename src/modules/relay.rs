@@ -162,9 +162,9 @@ mod tests {
         let echo_addr = echo_listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut remote, _) = echo_listener.accept().await.unwrap();
-            let mut data = vec![0u8; 128];
-            let n = remote.read(&mut data).await.unwrap();
-            remote.write_all(&data[..n]).await.unwrap();
+            let mut data = [0u8; 12];
+            remote.read_exact(&mut data).await.unwrap();
+            remote.write_all(&data).await.unwrap();
         });
 
         let local_listener = TcpListener::bind(("127.0.0.1", 0))
@@ -195,9 +195,9 @@ mod tests {
         let echo_addr = echo_listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut remote, _) = echo_listener.accept().await.unwrap();
-            let mut data = vec![0u8; 128];
-            let n = remote.read(&mut data).await.unwrap();
-            remote.write_all(&data[..n]).await.unwrap();
+            let mut data = [0u8; 12];
+            remote.read_exact(&mut data).await.unwrap();
+            remote.write_all(&data).await.unwrap();
         });
 
         let local_listener = TcpListener::bind(("127.0.0.1", 0))
