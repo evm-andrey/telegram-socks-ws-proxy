@@ -1,79 +1,45 @@
+mod backoff;
+mod ipv6_cache;
+
 use crate::config::RoutedConfig;
 use crate::modules::relay::{bridge_tcp_tcp, bridge_tcp_tcp_with_prelude, bridge_ws_tcp};
 use crate::modules::socks::{handle_socks5_handshake, is_ipv6, SocksCommand};
 use crate::modules::telegram::{
     extract_dc, ip_to_dc, is_telegram_ip, patch_init_dc, ws_domains, MtProtoMessageSplitter,
-    TelegramIpEntry,
+    TelegramInitInfo, TelegramIpEntry,
 };
 use crate::modules::ws::RawWsClient;
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
-use std::net::Ipv6Addr;
+use backoff::{begin_ws_probe, clear_ws_probe, disable_ws_route, record_ws_failure, WsDecision};
+use ipv6_cache::{learned_ipv6_entry, remember_ipv6_entry};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-const WS_FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
-const WS_ATTEMPT_WINDOW: Duration = Duration::from_secs(15);
+#[derive(Debug)]
+enum InitReadError {
+    Io(std::io::Error),
+    Timeout,
+}
 
-static WS_BACKOFF: Lazy<Mutex<WsBackoff>> = Lazy::new(|| Mutex::new(WsBackoff::default()));
-static LEARNED_IPV6_DC: Lazy<Mutex<HashMap<Ipv6Addr, TelegramIpEntry>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-#[derive(Debug, Default)]
-struct WsBackoff {
-    states: HashMap<(u8, bool), WsState>,
+#[derive(Debug)]
+struct ResolvedTelegramInit {
+    packet: Vec<u8>,
+    info: TelegramInitInfo,
+    patched: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WsState {
-    Probing(Instant),
-    Cooldown(Instant),
-    Disabled404,
+enum UnknownDcAction {
+    Close,
+    DirectPassthrough,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WsDecision {
-    ProbeNow,
-    ProbeInFlight,
-    Cooldown,
-    Disabled404,
-}
-
-impl WsBackoff {
-    fn begin_probe(&mut self, key: (u8, bool), now: Instant) -> WsDecision {
-        self.states.retain(|_, state| match state {
-            WsState::Probing(until) | WsState::Cooldown(until) => *until > now,
-            WsState::Disabled404 => true,
-        });
-
-        match self.states.get(&key).copied() {
-            Some(WsState::Probing(_)) => WsDecision::ProbeInFlight,
-            Some(WsState::Cooldown(_)) => WsDecision::Cooldown,
-            Some(WsState::Disabled404) => WsDecision::Disabled404,
-            None => {
-                self.states
-                    .insert(key, WsState::Probing(now + WS_ATTEMPT_WINDOW));
-                WsDecision::ProbeNow
-            }
-        }
-    }
-
-    fn record_failure(&mut self, key: (u8, bool), now: Instant, cooldown: Duration) {
-        self.states.insert(key, WsState::Cooldown(now + cooldown));
-    }
-
-    fn disable_404(&mut self, key: (u8, bool)) {
-        self.states.insert(key, WsState::Disabled404);
-    }
-
-    fn clear(&mut self, key: (u8, bool)) {
-        self.states.remove(&key);
-    }
+struct WsConnectAttempt {
+    client: Option<RawWsClient>,
+    all_404: bool,
 }
 
 pub async fn route_client(
@@ -96,67 +62,27 @@ pub async fn route_client(
     } = command;
 
     let target_is_ipv6 = is_ipv6(&target_host);
-    let target_is_telegram = is_telegram_ip(&target_host);
-
-    if !target_is_telegram {
-        debug!("passthrough {} -> {}:{}", peer, target_host, target_port);
-        if let Err(err) = bridge_tcp_tcp(stream, &target_host, target_port).await {
-            warn!("passthrough failed: {}", err);
-        }
+    if !is_telegram_ip(&target_host) {
+        passthrough_non_telegram(stream, &peer, &target_host, target_port).await;
         return;
     }
 
-    let mut init = [0u8; 64];
-    match timeout(
-        Duration::from_secs(cfg.read_timeout_secs),
-        stream.read_exact(&mut init),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(err)) => {
+    let init_packet = match read_telegram_init(&mut stream, cfg.read_timeout_secs).await {
+        Ok(packet) => packet,
+        Err(InitReadError::Io(err)) => {
             warn!("failed to read telegram init from {}: {}", peer, err);
             return;
         }
-        Err(_) => {
+        Err(InitReadError::Timeout) => {
             warn!("telegram init timeout {}", peer);
             return;
         }
-    }
+    };
 
-    let mut init_packet = init.to_vec();
-    let mut info = extract_dc(&init_packet);
-    let mut patched = false;
+    let resolved = resolve_telegram_init(&target_host, init_packet);
+    remember_telegram_ipv6(&target_host, target_is_ipv6, &resolved.info);
 
-    if info.dc.is_none() {
-        if let Some(entry) = learned_ipv6_entry(&target_host).or_else(|| ip_to_dc(&target_host)) {
-            let dc_signed = if entry.is_media {
-                -(entry.dc as i16)
-            } else {
-                entry.dc as i16
-            };
-            let patched_init = patch_init_dc(&init_packet, dc_signed);
-            init_packet = patched_init;
-            info = extract_dc(&init_packet);
-            patched = true;
-            info.dc = Some(entry.dc);
-            info.is_media = entry.is_media;
-        }
-    }
-
-    if target_is_ipv6 {
-        if let Some(dc) = info.dc {
-            remember_ipv6_entry(
-                &target_host,
-                TelegramIpEntry {
-                    dc,
-                    is_media: info.is_media,
-                },
-            );
-        }
-    }
-
-    if is_http_transport(&init_packet) {
+    if is_http_transport(&resolved.packet) {
         debug!(
             "http transport rejected {} -> {}:{}",
             peer, target_host, target_port
@@ -164,110 +90,76 @@ pub async fn route_client(
         return;
     }
 
-    let Some(dc) = info.dc else {
+    let Some(dc) = resolved.info.dc else {
         warn!("unknown dc {} -> {}:{}", peer, target_host, target_port);
-        if target_is_ipv6 {
-            debug!(
-                "unknown dc for ipv6 target, direct passthrough {} -> {}:{}",
-                peer, target_host, target_port
-            );
-            let _ =
-                bridge_tcp_tcp_with_prelude(stream, &target_host, target_port, &init_packet).await;
-            return;
-        }
+        handle_unknown_dc(
+            stream,
+            &peer,
+            &target_host,
+            target_port,
+            target_is_ipv6,
+            &resolved.packet,
+        )
+        .await;
         return;
     };
 
-    let domains = ws_domains(dc, info.is_media);
-    let ws_key = (dc, info.is_media);
+    let ws_key = (dc, resolved.info.is_media);
     let now = Instant::now();
-    let decision = WS_BACKOFF
-        .lock()
-        .expect("ws backoff lock")
-        .begin_probe(ws_key, now);
-
-    match decision {
+    match begin_ws_probe(ws_key, now) {
         WsDecision::ProbeNow => {}
         WsDecision::ProbeInFlight => {
             debug!(
                 "ws probe already in flight dc={} media={} -> concurrent ws attempt {}",
-                dc, info.is_media, peer
+                dc, resolved.info.is_media, peer
             );
         }
         WsDecision::Cooldown => {
             warn!(
                 "ws cooldown active dc={} media={} -> closing {}",
-                dc, info.is_media, peer
+                dc, resolved.info.is_media, peer
             );
             return;
         }
         WsDecision::Disabled404 => {
             warn!(
                 "ws disabled after 404 dc={} media={} -> closing {}",
-                dc, info.is_media, peer
+                dc, resolved.info.is_media, peer
             );
             return;
         }
     }
 
-    let mut ws_client = None;
-    let mut all_404 = true;
-    for domain in domains {
-        match RawWsClient::connect(&domain, Duration::from_secs(cfg.connect_timeout_secs)).await {
-            Ok(ws) => {
-                info!(
-                    "ws route selected dc={} media={} -> {}",
-                    dc, info.is_media, domain
-                );
-                ws_client = Some(ws);
-                break;
-            }
-            Err(err) => {
-                if err.status_code() != Some(404) {
-                    all_404 = false;
-                }
-                warn!("ws connect failed {} -> {} ({})", peer, domain, err);
-                continue;
-            }
-        }
-    }
-
-    if let Some(ws) = ws_client {
-        WS_BACKOFF.lock().expect("ws backoff lock").clear(ws_key);
-        let splitter = MtProtoMessageSplitter::new(&init_packet);
+    let ws_attempt = connect_ws_route(&peer, cfg.as_ref(), dc, resolved.info.is_media).await;
+    if let Some(ws) = ws_attempt.client {
+        clear_ws_probe(ws_key);
+        let splitter = MtProtoMessageSplitter::new(&resolved.packet);
         let session = format!(
             "peer={} dc={} media={} target={} via_ws",
-            peer, dc, info.is_media, target_host
+            peer, dc, resolved.info.is_media, target_host
         );
-        if let Err(err) = bridge_ws_tcp(stream, ws, init_packet, splitter, &session).await {
+        if let Err(err) = bridge_ws_tcp(stream, ws, resolved.packet, splitter, &session).await {
             warn!("ws bridge err {}: {}", peer, err);
         }
         return;
     }
 
-    if all_404 {
-        WS_BACKOFF
-            .lock()
-            .expect("ws backoff lock")
-            .disable_404(ws_key);
+    if ws_attempt.all_404 {
+        disable_ws_route(ws_key);
         warn!(
             "ws disabled for runtime after HTTP 404 dc={} media={}",
-            dc, info.is_media
+            dc, resolved.info.is_media
         );
     } else {
-        WS_BACKOFF.lock().expect("ws backoff lock").record_failure(
-            ws_key,
-            now,
-            WS_FAILURE_COOLDOWN,
-        );
+        record_ws_failure(ws_key, now);
     }
 
-    if patched {
+    if resolved.patched {
         debug!("ws failed after patched init {} from {}", peer, target_host);
     }
     warn!(
         "ws route unavailable dc={} media={} peer={}",
-        dc, info.is_media, peer
+        dc, resolved.info.is_media, peer
     );
 }
 
@@ -289,29 +181,164 @@ pub fn route_decision(host: &str, port: u16, has_dc: bool) -> &'static str {
     }
 }
 
-fn learned_ipv6_entry(host: &str) -> Option<TelegramIpEntry> {
-    let ip = host.parse::<Ipv6Addr>().ok()?;
-    LEARNED_IPV6_DC
-        .lock()
-        .expect("ipv6 dc cache lock")
-        .get(&ip)
-        .cloned()
+async fn passthrough_non_telegram(
+    stream: TcpStream,
+    peer: &str,
+    target_host: &str,
+    target_port: u16,
+) {
+    debug!("passthrough {} -> {}:{}", peer, target_host, target_port);
+    if let Err(err) = bridge_tcp_tcp(stream, target_host, target_port).await {
+        warn!("passthrough failed: {}", err);
+    }
 }
 
-fn remember_ipv6_entry(host: &str, entry: TelegramIpEntry) {
-    let Ok(ip) = host.parse::<Ipv6Addr>() else {
-        return;
-    };
-    LEARNED_IPV6_DC
-        .lock()
-        .expect("ipv6 dc cache lock")
-        .insert(ip, entry);
+async fn read_telegram_init(
+    stream: &mut TcpStream,
+    timeout_secs: u64,
+) -> Result<Vec<u8>, InitReadError> {
+    let mut init = [0u8; 64];
+    match timeout(
+        Duration::from_secs(timeout_secs),
+        stream.read_exact(&mut init),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(init.to_vec()),
+        Ok(Err(err)) => Err(InitReadError::Io(err)),
+        Err(_) => Err(InitReadError::Timeout),
+    }
+}
+
+fn resolve_telegram_init(target_host: &str, init_packet: Vec<u8>) -> ResolvedTelegramInit {
+    let mut packet = init_packet;
+    let mut info = extract_dc(&packet);
+    let mut patched = false;
+
+    if info.dc.is_none() {
+        if let Some(entry) = learned_ipv6_entry(target_host).or_else(|| ip_to_dc(target_host)) {
+            let signed_dc = if entry.is_media {
+                -(entry.dc as i16)
+            } else {
+                entry.dc as i16
+            };
+            packet = patch_init_dc(&packet, signed_dc);
+            info = extract_dc(&packet);
+            patched = true;
+            info.dc = Some(entry.dc);
+            info.is_media = entry.is_media;
+        }
+    }
+
+    ResolvedTelegramInit {
+        packet,
+        info,
+        patched,
+    }
+}
+
+fn remember_telegram_ipv6(target_host: &str, target_is_ipv6: bool, info: &TelegramInitInfo) {
+    if target_is_ipv6 {
+        if let Some(dc) = info.dc {
+            remember_ipv6_entry(
+                target_host,
+                TelegramIpEntry {
+                    dc,
+                    is_media: info.is_media,
+                },
+            );
+        }
+    }
+}
+
+async fn handle_unknown_dc(
+    stream: TcpStream,
+    peer: &str,
+    target_host: &str,
+    target_port: u16,
+    target_is_ipv6: bool,
+    init_packet: &[u8],
+) {
+    if unknown_dc_action(target_is_ipv6) == UnknownDcAction::DirectPassthrough {
+        debug!(
+            "unknown dc for ipv6 target, direct passthrough {} -> {}:{}",
+            peer, target_host, target_port
+        );
+        let _ = bridge_tcp_tcp_with_prelude(stream, target_host, target_port, init_packet).await;
+    }
+}
+
+fn unknown_dc_action(target_is_ipv6: bool) -> UnknownDcAction {
+    if target_is_ipv6 {
+        UnknownDcAction::DirectPassthrough
+    } else {
+        UnknownDcAction::Close
+    }
+}
+
+async fn connect_ws_route(
+    peer: &str,
+    cfg: &RoutedConfig,
+    dc: u8,
+    is_media: bool,
+) -> WsConnectAttempt {
+    let mut ws_client = None;
+    let mut all_404 = true;
+
+    for domain in ws_domains(dc, is_media) {
+        match RawWsClient::connect(&domain, Duration::from_secs(cfg.connect_timeout_secs)).await {
+            Ok(ws) => {
+                info!(
+                    "ws route selected dc={} media={} -> {}",
+                    dc, is_media, domain
+                );
+                ws_client = Some(ws);
+                break;
+            }
+            Err(err) => {
+                if err.status_code() != Some(404) {
+                    all_404 = false;
+                }
+                warn!("ws connect failed {} -> {} ({})", peer, domain, err);
+            }
+        }
+    }
+
+    WsConnectAttempt {
+        client: ws_client,
+        all_404,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{route_decision, WsBackoff, WsDecision};
-    use std::time::{Duration, Instant};
+    use super::{
+        remember_ipv6_entry, resolve_telegram_init, route_decision, unknown_dc_action,
+        UnknownDcAction,
+    };
+    use aes::cipher::{KeyIvInit, StreamCipher};
+    use aes::Aes256;
+
+    type Aes256Ctr = ctr::Ctr128BE<Aes256>;
+
+    fn build_init(dc: i16) -> Vec<u8> {
+        let mut init = [0u8; 64];
+        init[8..40].copy_from_slice(&[3u8; 32]);
+        init[40..56].copy_from_slice(&[4u8; 16]);
+
+        let mut cipher = Aes256Ctr::new_from_slices(&init[8..40], &init[40..56]).unwrap();
+        let mut stream = [0u8; 64];
+        cipher.apply_keystream(&mut stream);
+
+        let mut plain = [0u8; 8];
+        plain[0..4].copy_from_slice(&0xEFEFEFEFu32.to_le_bytes());
+        plain[4..6].copy_from_slice(&dc.to_le_bytes());
+        for idx in 0..8 {
+            init[56 + idx] = stream[56 + idx] ^ plain[idx];
+        }
+
+        init.to_vec()
+    }
 
     #[test]
     fn route_rules() {
@@ -324,61 +351,33 @@ mod tests {
     }
 
     #[test]
-    fn ws_backoff_expires_after_cooldown() {
-        let mut backoff = WsBackoff::default();
-        let key = (2, false);
-        let now = Instant::now();
-
-        assert_eq!(backoff.begin_probe(key, now), WsDecision::ProbeNow);
-        backoff.record_failure(key, now, Duration::from_secs(5));
-        assert_eq!(
-            backoff.begin_probe(key, now + Duration::from_secs(4)),
-            WsDecision::Cooldown
-        );
-        assert_eq!(
-            backoff.begin_probe(key, now + Duration::from_secs(5)),
-            WsDecision::ProbeNow
-        );
+    fn resolve_telegram_init_patches_from_static_ipv4_mapping() {
+        let resolved = resolve_telegram_init("149.154.167.220", build_init(0));
+        assert_eq!(resolved.info.dc, Some(2));
+        assert!(!resolved.info.is_media);
+        assert!(resolved.patched);
     }
 
     #[test]
-    fn ws_backoff_can_be_cleared() {
-        let mut backoff = WsBackoff::default();
-        let key = (4, true);
-        let now = Instant::now();
+    fn resolve_telegram_init_uses_learned_ipv6_mapping() {
+        let host = "2001:67c:4e8::1234";
+        remember_ipv6_entry(
+            host,
+            crate::modules::telegram::TelegramIpEntry {
+                dc: 4,
+                is_media: true,
+            },
+        );
 
-        backoff.record_failure(key, now, Duration::from_secs(30));
-        assert_eq!(
-            backoff.begin_probe(key, now + Duration::from_secs(1)),
-            WsDecision::Cooldown
-        );
-        backoff.clear(key);
-        assert_eq!(
-            backoff.begin_probe(key, now + Duration::from_secs(1)),
-            WsDecision::ProbeNow
-        );
+        let resolved = resolve_telegram_init(host, build_init(0));
+        assert_eq!(resolved.info.dc, Some(4));
+        assert!(resolved.info.is_media);
+        assert!(resolved.patched);
     }
 
     #[test]
-    fn ws_backoff_blocks_parallel_probe_window() {
-        let mut backoff = WsBackoff::default();
-        let key = (2, true);
-        let now = Instant::now();
-
-        assert_eq!(backoff.begin_probe(key, now), WsDecision::ProbeNow);
-        assert_eq!(
-            backoff.begin_probe(key, now + Duration::from_secs(1)),
-            WsDecision::ProbeInFlight
-        );
-    }
-
-    #[test]
-    fn ws_backoff_can_disable_404_for_runtime() {
-        let mut backoff = WsBackoff::default();
-        let key = (5, false);
-        let now = Instant::now();
-
-        backoff.disable_404(key);
-        assert_eq!(backoff.begin_probe(key, now), WsDecision::Disabled404);
+    fn unknown_dc_for_ipv6_falls_back_to_passthrough() {
+        assert_eq!(unknown_dc_action(true), UnknownDcAction::DirectPassthrough);
+        assert_eq!(unknown_dc_action(false), UnknownDcAction::Close);
     }
 }

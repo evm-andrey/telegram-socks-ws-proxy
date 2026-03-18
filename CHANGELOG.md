@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 - 2026-03-18
+
+- Refactored Telegram routing internals by splitting `routing` into focused helpers with isolated WS backoff and learned IPv6 cache state.
+- Split `telegram` internals into catalog, init and splitter modules while preserving the existing external behavior and import paths.
+- Expanded unit coverage for init patching, static IPv4 DC mapping and learned IPv6 target resolution.
+
 ## 0.1.2 - 2026-03-18
 
 - Added SOCKS5 username/password authentication via `SOCKS_USERS` with support for multiple accounts.

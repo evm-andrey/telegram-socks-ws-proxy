@@ -92,7 +92,7 @@ docker build -t tg-ws-proxy-rs:latest .
 docker buildx build \
   --platform linux/amd64 \
   -t ghcr.io/evm-andrey/telegram-socks-ws-proxy:latest \
-  -t ghcr.io/evm-andrey/telegram-socks-ws-proxy:0.1.2 \
+  -t ghcr.io/evm-andrey/telegram-socks-ws-proxy:0.1.3 \
   --push \
   .
 ```
